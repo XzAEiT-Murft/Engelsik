@@ -58,7 +58,6 @@ Create a `.env` file in the root of the project:
 ```env
 TOKEN=your_discord_bot_token
 CLIENT_ID=your_discord_application_id
-GUILD_ID=your_discord_server_id
 
 SPOTIFY_CLIENT_ID=your_spotify_client_id
 SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
