@@ -43,7 +43,7 @@ Current status for other platforms:
 Clone the repository:
 
 ```bash
-git clone https://github.com/your-user/Engelsik.git
+git clone https://github.com/XzAEiT-Murft/Engelsik
 cd Engelsik
 ```
 
