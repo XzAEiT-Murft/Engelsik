@@ -19,6 +19,8 @@ Thumbs.db
 # Archivos temporales
 *.tmp
 *.temp
+.cache/
+*-player-script.js
 
 # Cobertura y tests
 coverage/
