@@ -3,6 +3,8 @@ node_modules/
 
 # Variables sensibles
 .env
+.env.local
+.env.*.local
 
 # Logs
 npm-debug.log*

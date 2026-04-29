@@ -120,7 +120,8 @@ function buildSong({
     youtubeQuery,
     youtubeUrl = null,
     thumbnail = null,
-    originalUrl = null
+    originalUrl = null,
+    durationSeconds = null
 }) {
     return {
         title: title || 'Sin titulo',
@@ -129,7 +130,11 @@ function buildSong({
         youtubeQuery: youtubeQuery || `${title || ''} ${artist || ''}`.trim(),
         youtubeUrl,
         thumbnail,
-        originalUrl
+        originalUrl,
+        durationSeconds:
+            Number.isFinite(durationSeconds) && durationSeconds >= 0
+                ? durationSeconds
+                : null
     };
 }
 
@@ -184,7 +189,7 @@ async function getYtDlpJson(args) {
     return JSON.parse(raw);
 }
 
-async function searchYouTubeEntry(query, limit = 1) {
+async function searchYouTubeEntries(query, limit = 1) {
     const result = await getYtDlpJson([
         `ytsearch${limit}:${query}`,
         '--flat-playlist',
@@ -193,7 +198,60 @@ async function searchYouTubeEntry(query, limit = 1) {
         '--skip-download'
     ]);
 
-    return result.entries?.[0] || null;
+    return result.entries?.filter(Boolean) || [];
+}
+
+async function searchYouTubeEntry(query, limit = 1) {
+    const entries = await searchYouTubeEntries(query, limit);
+    return entries[0] || null;
+}
+
+function buildSongFromYouTubeEntry(entry, fallbackTitle = 'Video de YouTube') {
+    return buildSong({
+        title: entry.title || fallbackTitle,
+        artist: entry.uploader || entry.channel || '',
+        source: 'youtube',
+        youtubeQuery: `${entry.title || fallbackTitle} ${
+            entry.uploader || entry.channel || ''
+        }`.trim(),
+        youtubeUrl:
+            entry.url ||
+            (entry.id ? `https://www.youtube.com/watch?v=${entry.id}` : null),
+        thumbnail: entry.thumbnails?.[0]?.url || entry.thumbnail || null,
+        originalUrl:
+            entry.url ||
+            (entry.id ? `https://www.youtube.com/watch?v=${entry.id}` : null),
+        durationSeconds: entry.duration ?? null
+    });
+}
+
+async function getYouTubeVideoMetadata(url) {
+    return getYtDlpJson([
+        url,
+        '--dump-single-json',
+        '--no-warnings',
+        '--no-playlist',
+        '--skip-download'
+    ]);
+}
+
+async function searchYouTubeCandidates(query, limit = 5) {
+    const entries = await searchYouTubeEntries(query, limit);
+    const songs = entries.map(entry => buildSongFromYouTubeEntry(entry, query));
+
+    if (!songs.length) {
+        throw createUserFacingError(
+            'No pude encontrar esa busqueda en YouTube.'
+        );
+    }
+
+    return attachMetadata(songs, {
+        platform: 'youtube',
+        platformLabel: 'YouTube',
+        inputType: 'track',
+        collectionName: null,
+        thumbnail: songs[0]?.thumbnail || null
+    });
 }
 
 function parseSpotifyResource(url) {
@@ -263,23 +321,14 @@ async function resolveYoutubeSearch(query) {
         );
     }
 
-    const song = buildSong({
-        title: metadata.title || query,
-        artist: metadata.uploader || metadata.channel || '',
-        source: 'youtube',
-        youtubeQuery: query,
-        youtubeUrl:
-            metadata.url ||
-            (metadata.id
-                ? `https://www.youtube.com/watch?v=${metadata.id}`
-                : null),
-        thumbnail: metadata.thumbnails?.[0]?.url || metadata.thumbnail || null,
-        originalUrl:
-            metadata.url ||
-            (metadata.id
-                ? `https://www.youtube.com/watch?v=${metadata.id}`
-                : null)
-    });
+    const song = buildSongFromYouTubeEntry(
+        {
+            ...metadata,
+            title: metadata.title || query
+        },
+        query
+    );
+    song.youtubeQuery = query;
 
     return attachMetadata([song], {
         platform: 'youtube',
@@ -291,13 +340,7 @@ async function resolveYoutubeSearch(query) {
 }
 
 async function resolveYoutubeVideo(url) {
-    const metadata = await getYtDlpJson([
-        url,
-        '--dump-single-json',
-        '--no-warnings',
-        '--no-playlist',
-        '--skip-download'
-    ]);
+    const metadata = await getYouTubeVideoMetadata(url);
 
     const song = buildSong({
         title: metadata.title,
@@ -310,7 +353,8 @@ async function resolveYoutubeVideo(url) {
                 ? `https://www.youtube.com/watch?v=${metadata.id}`
                 : null),
         thumbnail: metadata.thumbnail || null,
-        originalUrl: metadata.webpage_url || url
+        originalUrl: metadata.webpage_url || url,
+        durationSeconds: metadata.duration ?? null
     });
 
     return attachMetadata([song], {
@@ -344,12 +388,13 @@ async function resolveYoutubePlaylist(url) {
                     (entry.id
                         ? `https://www.youtube.com/watch?v=${entry.id}`
                         : null),
-                thumbnail: entry.thumbnail || null,
+                thumbnail: entry.thumbnails?.[0]?.url || entry.thumbnail || null,
                 originalUrl:
                     entry.url ||
                     (entry.id
                         ? `https://www.youtube.com/watch?v=${entry.id}`
-                        : null)
+                        : null),
+                durationSeconds: entry.duration ?? null
             })
         );
 
@@ -648,6 +693,33 @@ async function resolveInput(query) {
 
 async function resolvePlayableSong(song, guildId) {
     if (song.youtubeUrl) {
+        if (
+            song.durationSeconds &&
+            song.thumbnail &&
+            (song.artist || song.source !== 'youtube')
+        ) {
+            return song;
+        }
+
+        const metadata = await getYouTubeVideoMetadata(song.youtubeUrl);
+
+        if (!song.durationSeconds && Number.isFinite(metadata.duration)) {
+            song.durationSeconds = metadata.duration;
+        }
+
+        if (!song.thumbnail) {
+            song.thumbnail =
+                metadata.thumbnail || metadata.thumbnails?.[0]?.url || null;
+        }
+
+        if (!song.artist) {
+            song.artist = metadata.uploader || metadata.channel || '';
+        }
+
+        if (!song.originalUrl) {
+            song.originalUrl = metadata.webpage_url || song.youtubeUrl;
+        }
+
         return song;
     }
 
@@ -686,11 +758,16 @@ async function resolvePlayableSong(song, guildId) {
         song.artist = metadata.uploader || metadata.channel;
     }
 
+    if (!song.durationSeconds && Number.isFinite(metadata.duration)) {
+        song.durationSeconds = metadata.duration;
+    }
+
     return song;
 }
 
 module.exports = {
     resolveInput,
     resolvePlayableSong,
-    getYtDlp
+    getYtDlp,
+    searchYouTubeCandidates
 };

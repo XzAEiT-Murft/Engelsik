@@ -1,4 +1,5 @@
 const prism = require('prism-media');
+const ffmpegPath = require('ffmpeg-static');
 const {
     joinVoiceChannel,
     entersState,
@@ -13,6 +14,10 @@ const {
     resolvePlayableSong,
     getYtDlp
 } = require('../utils/platformResolver');
+const {
+    buildNowPlayingEmbed,
+    buildPlaybackControls
+} = require('../utils/musicDisplay');
 
 const queues = new Map();
 
@@ -36,9 +41,88 @@ function clearDisconnectTimeout(queue) {
     queue.timeout = null;
 }
 
+function clearInactivityTimeout(queue) {
+    if (!queue?.inactivityTimeout) {
+        return;
+    }
+
+    clearTimeout(queue.inactivityTimeout);
+    queue.inactivityTimeout = null;
+}
+
+function stopVoiceChannelMonitor(queue) {
+    if (!queue?.voiceChannelInterval) {
+        return;
+    }
+
+    clearInterval(queue.voiceChannelInterval);
+    queue.voiceChannelInterval = null;
+}
+
+function stopProgressUpdater(queue) {
+    if (!queue?.progressInterval) {
+        return;
+    }
+
+    clearInterval(queue.progressInterval);
+    queue.progressInterval = null;
+}
+
+function resetPlaybackProgress(queue) {
+    if (!queue) {
+        return;
+    }
+
+    queue.currentStartedAt = null;
+    queue.currentElapsedMs = 0;
+
+    if (queue.songs[0]) {
+        queue.songs[0].currentTimeSeconds = 0;
+    }
+}
+
+function getCurrentProgressSeconds(queue) {
+    if (!queue) {
+        return 0;
+    }
+
+    const elapsedMs =
+        queue.currentElapsedMs +
+        (queue.currentStartedAt ? Date.now() - queue.currentStartedAt : 0);
+    const currentSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+    const totalSeconds = queue.songs[0]?.durationSeconds;
+    const clampedSeconds =
+        Number.isFinite(totalSeconds) && totalSeconds > 0
+            ? Math.min(currentSeconds, totalSeconds)
+            : currentSeconds;
+
+    if (queue.songs[0]) {
+        queue.songs[0].currentTimeSeconds = clampedSeconds;
+    }
+
+    return clampedSeconds;
+}
+
+function getVoiceChannel(queue) {
+    if (!queue?.guild || !queue.voiceChannelId) {
+        return null;
+    }
+
+    return queue.guild.channels.cache.get(queue.voiceChannelId) || null;
+}
+
+function isUserInBotVoiceChannel(interaction, queue) {
+    const memberChannelId = interaction.member?.voice?.channelId;
+    const botChannelId = queue?.connection?.joinConfig?.channelId;
+
+    return Boolean(memberChannelId && botChannelId && memberChannelId === botChannelId);
+}
+
 function killProcess(queue, guildId) {
     if (!queue?.process || queue.process.killed) {
-        queue.process = null;
+        if (queue) {
+            queue.process = null;
+        }
         return;
     }
 
@@ -54,6 +138,156 @@ function killProcess(queue, guildId) {
     queue.process = null;
 }
 
+function buildStreamArgs(song, startTimeSeconds = 0) {
+    const args = [song.youtubeUrl, '-f', 'bestaudio[ext=webm]/bestaudio'];
+
+    if (Number.isFinite(startTimeSeconds) && startTimeSeconds > 0) {
+        if (!ffmpegPath) {
+            throw new Error(
+                'No hay ffmpeg disponible para mover la reproduccion.'
+            );
+        }
+
+        args.push(
+            '--downloader',
+            'ffmpeg',
+            '--downloader-args',
+            `ffmpeg_i:-ss ${startTimeSeconds}`,
+            '--ffmpeg-location',
+            ffmpegPath
+        );
+    }
+
+    args.push('-o', '-', '--no-playlist');
+    return args;
+}
+
+async function updateNowPlayingMessage(guildId) {
+    const queue = queues.get(guildId);
+
+    if (!queue?.nowPlayingMessage || !queue.songs.length) {
+        return;
+    }
+
+    try {
+        await queue.nowPlayingMessage.edit({
+            content: '',
+            embeds: [
+                buildNowPlayingEmbed(queue.songs[0], {
+                    currentSeconds: getCurrentProgressSeconds(queue),
+                    isPaused: queue.paused
+                })
+            ],
+            components: buildPlaybackControls(guildId, queue.paused)
+        });
+    } catch (error) {
+        logDebug(guildId, 'No pude actualizar el mensaje de reproduccion', {
+            error: error.message
+        });
+        stopProgressUpdater(queue);
+        queue.nowPlayingMessage = null;
+    }
+}
+
+function startProgressUpdater(guildId, options = {}) {
+    const queue = queues.get(guildId);
+
+    if (!queue?.nowPlayingMessage || !queue.songs.length) {
+        return;
+    }
+
+    stopProgressUpdater(queue);
+
+    if (options.immediate) {
+        void updateNowPlayingMessage(guildId);
+    }
+
+    queue.progressInterval = setInterval(() => {
+        void updateNowPlayingMessage(guildId);
+    }, 5_000);
+}
+
+function setNowPlayingMessage(guildId, message) {
+    const queue = queues.get(guildId);
+
+    if (!queue) {
+        return;
+    }
+
+    queue.nowPlayingMessage = message;
+
+    if (queue.songs.length) {
+        startProgressUpdater(guildId);
+    }
+}
+
+function startEmptyChannelTimeout(guildId) {
+    const queue = queues.get(guildId);
+
+    if (!queue || queue.inactivityTimeout) {
+        return;
+    }
+
+    logDebug(
+        guildId,
+        'El canal de voz quedo vacio, esperando 30 segundos antes de desconectar'
+    );
+
+    queue.inactivityTimeout = setTimeout(() => {
+        const refreshedQueue = queues.get(guildId);
+        const channel = getVoiceChannel(refreshedQueue);
+        const members = channel?.members?.filter(member => !member.user.bot);
+
+        if (!channel || !members || members.size === 0) {
+            logDebug(
+                guildId,
+                'El canal siguio vacio despues de 30 segundos, desconectando Engelsik'
+            );
+            destroyQueue(guildId);
+            return;
+        }
+
+        clearInactivityTimeout(refreshedQueue);
+    }, 30_000);
+}
+
+function monitorVoiceChannelOccupancy(guildId) {
+    const queue = queues.get(guildId);
+    const channel = getVoiceChannel(queue);
+
+    if (!queue || !channel?.members) {
+        return;
+    }
+
+    const members = channel.members.filter(member => !member.user.bot);
+
+    if (members.size === 0) {
+        startEmptyChannelTimeout(guildId);
+        return;
+    }
+
+    if (queue.inactivityTimeout) {
+        logDebug(
+            guildId,
+            'Se detectaron usuarios en el canal otra vez, cancelando timeout por inactividad'
+        );
+        clearInactivityTimeout(queue);
+    }
+}
+
+function startVoiceChannelMonitor(guildId, queue) {
+    if (!queue) {
+        return;
+    }
+
+    stopVoiceChannelMonitor(queue);
+    queue.voiceChannelInterval = setInterval(() => {
+        monitorVoiceChannelOccupancy(guildId);
+    }, 5_000);
+
+    monitorVoiceChannelOccupancy(guildId);
+}
+
 function destroyQueue(guildId, options = {}) {
     const { destroyConnection = true } = options;
     const queue = queues.get(guildId);
@@ -63,6 +297,10 @@ function destroyQueue(guildId, options = {}) {
     }
 
     clearDisconnectTimeout(queue);
+    clearInactivityTimeout(queue);
+    stopVoiceChannelMonitor(queue);
+    stopProgressUpdater(queue);
+    resetPlaybackProgress(queue);
     killProcess(queue, guildId);
 
     if (queue.player) {
@@ -116,7 +354,7 @@ function scheduleDisconnect(guildId) {
     }, 30_000);
 }
 
-async function startCurrentSong(guildId) {
+async function startCurrentSong(guildId, options = {}) {
     const queue = queues.get(guildId);
 
     if (!queue || !queue.songs.length) {
@@ -125,32 +363,31 @@ async function startCurrentSong(guildId) {
     }
 
     const currentSong = queue.songs[0];
+    const startTimeSeconds = Math.max(
+        0,
+        Math.floor(options.startTimeSeconds || 0)
+    );
 
     clearDisconnectTimeout(queue);
+    stopProgressUpdater(queue);
+    queue.ignoreNextIdle = Boolean(options.controlledRestart);
     killProcess(queue, guildId);
+    resetPlaybackProgress(queue);
+    queue.currentElapsedMs = startTimeSeconds * 1000;
+    currentSong.currentTimeSeconds = startTimeSeconds;
 
     queue.paused = false;
     await resolvePlayableSong(currentSong, guildId);
 
     const ytDlp = await getYtDlp();
-    const ytDlpExecution = ytDlp.exec(
-        [
-            currentSong.youtubeUrl,
-            '-f',
-            'bestaudio[ext=webm]/bestaudio',
-            '-o',
-            '-',
-            '--no-playlist'
-        ],
-        {
-            // yt-dlp-wrap rompe internamente si stderr es null.
-            stdio: ['ignore', 'pipe', 'pipe']
-        }
-    );
+    const ytDlpExecution = ytDlp.exec(buildStreamArgs(currentSong, startTimeSeconds), {
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
 
     const ytDlpProcess = ytDlpExecution.ytDlpProcess;
 
     if (!ytDlpProcess?.stdout) {
+        queue.ignoreNextIdle = false;
         throw new Error('No se pudo obtener stdout del proceso de yt-dlp.');
     }
 
@@ -172,10 +409,7 @@ async function startCurrentSong(guildId) {
 
     ytDlpProcess.stdout.removeAllListeners('data');
 
-    // La salida es webm, por eso el demuxer correcto es WebmDemuxer.
-    const opusStream = ytDlpProcess.stdout.pipe(
-        new prism.opus.WebmDemuxer()
-    );
+    const opusStream = ytDlpProcess.stdout.pipe(new prism.opus.WebmDemuxer());
 
     opusStream.on('error', error => {
         console.error(
@@ -186,7 +420,8 @@ async function startCurrentSong(guildId) {
 
     logDebug(guildId, 'Stream creado', {
         url: currentSong.youtubeUrl,
-        pid: ytDlpProcess.pid
+        pid: ytDlpProcess.pid,
+        startTimeSeconds
     });
 
     const resource = createAudioResource(opusStream, {
@@ -195,6 +430,7 @@ async function startCurrentSong(guildId) {
     });
 
     queue.connection.subscribe(queue.player);
+    queue.currentStartedAt = Date.now();
     queue.player.play(resource);
 
     return currentSong;
@@ -211,6 +447,8 @@ async function playNextAvailableSong(guildId) {
         try {
             return await startCurrentSong(guildId);
         } catch (error) {
+            queue.ignoreNextIdle = false;
+
             const failedSong = queue.songs.shift();
 
             console.error(
@@ -235,9 +473,17 @@ async function handleIdle(guildId) {
         return;
     }
 
-    const finishedSong = queue.songs.shift();
-    queue.paused = false;
+    if (queue.ignoreNextIdle) {
+        queue.ignoreNextIdle = false;
+        logDebug(guildId, 'Idle ignorado durante reinicio controlado');
+        return;
+    }
 
+    const finishedSong = queue.songs.shift();
+
+    queue.paused = false;
+    stopProgressUpdater(queue);
+    resetPlaybackProgress(queue);
     killProcess(queue, guildId);
 
     logDebug(guildId, 'Reproductor en idle', {
@@ -253,16 +499,212 @@ async function handleIdle(guildId) {
     scheduleDisconnect(guildId);
 }
 
+function handlePlayerPlaying(guildId) {
+    const queue = queues.get(guildId);
+
+    if (!queue) {
+        return;
+    }
+
+    if (!queue.currentStartedAt && queue.songs.length) {
+        queue.currentStartedAt = Date.now();
+    }
+
+    queue.ignoreNextIdle = false;
+    queue.paused = false;
+
+    logDebug(guildId, 'Reproductor en playing', {
+        song: queue.songs[0]?.title || null
+    });
+
+    if (queue.nowPlayingMessage) {
+        startProgressUpdater(guildId, { immediate: true });
+    }
+}
+
+function handlePlayerPaused(guildId) {
+    const queue = queues.get(guildId);
+
+    if (!queue) {
+        return;
+    }
+
+    if (queue.currentStartedAt) {
+        queue.currentElapsedMs += Date.now() - queue.currentStartedAt;
+        queue.currentStartedAt = null;
+    }
+
+    queue.paused = true;
+    stopProgressUpdater(queue);
+
+    logDebug(guildId, 'Reproductor en paused', {
+        song: queue.songs[0]?.title || null
+    });
+
+    if (queue.nowPlayingMessage) {
+        void updateNowPlayingMessage(guildId);
+    }
+}
+
+async function restartCurrentSongAt(guildId, targetSeconds) {
+    const queue = queues.get(guildId);
+
+    if (!queue?.songs.length) {
+        throw new Error('No hay ninguna cancion reproduciendose.');
+    }
+
+    if (queue.controlLock) {
+        throw new Error('Espera a que termine la accion anterior.');
+    }
+
+    queue.controlLock = true;
+
+    try {
+        logDebug(guildId, 'Reiniciando stream en un nuevo punto', {
+            targetSeconds
+        });
+
+        return await startCurrentSong(guildId, {
+            startTimeSeconds: targetSeconds,
+            controlledRestart: true
+        });
+    } catch (error) {
+        queue.ignoreNextIdle = false;
+        throw error;
+    } finally {
+        queue.controlLock = false;
+    }
+}
+
+async function seekCurrentSong(guildId, deltaSeconds) {
+    const queue = queues.get(guildId);
+
+    if (!queue?.songs.length) {
+        throw new Error('No hay ninguna cancion reproduciendose.');
+    }
+
+    await resolvePlayableSong(queue.songs[0], guildId);
+
+    const currentTimeSeconds = getCurrentProgressSeconds(queue);
+    const durationSeconds = queue.songs[0].durationSeconds;
+    const maxTimeSeconds =
+        Number.isFinite(durationSeconds) && durationSeconds > 1
+            ? durationSeconds - 1
+            : Infinity;
+    const targetSeconds = Math.max(
+        0,
+        Math.min(Math.round(currentTimeSeconds + deltaSeconds), maxTimeSeconds)
+    );
+
+    if (targetSeconds === currentTimeSeconds) {
+        return queue.songs[0];
+    }
+
+    logDebug(guildId, 'Aplicando seek manual', {
+        from: currentTimeSeconds,
+        to: targetSeconds,
+        deltaSeconds
+    });
+
+    return restartCurrentSongAt(guildId, targetSeconds);
+}
+
+async function handleControlInteraction(interaction) {
+    const [, customGuildId, action] = interaction.customId.split(':');
+
+    if (!interaction.guildId || interaction.guildId !== customGuildId) {
+        await interaction.reply({
+            content: 'Ese control ya no corresponde a este servidor.',
+            ephemeral: true
+        });
+        return true;
+    }
+
+    const queue = queues.get(customGuildId);
+
+    if (!queue || !queue.songs.length) {
+        await interaction.reply({
+            content: 'No hay ninguna cancion reproduciendose ahora mismo.',
+            ephemeral: true
+        });
+        return true;
+    }
+
+    if (
+        queue.nowPlayingMessage &&
+        interaction.message.id !== queue.nowPlayingMessage.id
+    ) {
+        await interaction.reply({
+            content: 'Usa el mensaje de reproduccion mas reciente.',
+            ephemeral: true
+        });
+        return true;
+    }
+
+    if (!isUserInBotVoiceChannel(interaction, queue)) {
+        await interaction.reply({
+            content: 'Debes estar en el mismo canal de voz que Engelsik.',
+            ephemeral: true
+        });
+        return true;
+    }
+
+    queue.nowPlayingMessage = interaction.message;
+    await interaction.deferUpdate();
+
+    try {
+        if (action === 'toggle') {
+            if (queue.paused) {
+                queue.player.unpause();
+            } else {
+                queue.player.pause(true);
+            }
+        } else if (action === 'back10') {
+            await seekCurrentSong(customGuildId, -10);
+        } else if (action === 'back5') {
+            await seekCurrentSong(customGuildId, -5);
+        } else if (action === 'forward5') {
+            await seekCurrentSong(customGuildId, 5);
+        } else if (action === 'forward10') {
+            await seekCurrentSong(customGuildId, 10);
+        }
+
+        await updateNowPlayingMessage(customGuildId);
+    } catch (error) {
+        console.error(
+            `[play][guild:${customGuildId}] Error manejando controles de reproduccion:`,
+            error
+        );
+
+        try {
+            await interaction.followUp({
+                content:
+                    error.message ||
+                    'No pude aplicar ese control de reproduccion.',
+                ephemeral: true
+            });
+        } catch {}
+    }
+
+    return true;
+}
+
 function attachQueueListeners(guildId, queue) {
     queue.connection.on(VoiceConnectionStatus.Disconnected, () => {
         logDebug(guildId, 'Conexion de voz desconectada');
         destroyQueue(guildId, { destroyConnection: false });
     });
 
+    queue.connection.on('stateChange', () => {
+        monitorVoiceChannelOccupancy(guildId);
+    });
+
     queue.player.on(AudioPlayerStatus.Playing, () => {
-        logDebug(guildId, 'Reproductor en playing', {
-            song: queue.songs[0]?.title || null
-        });
+        handlePlayerPlaying(guildId);
+    });
+
+    queue.player.on(AudioPlayerStatus.Paused, () => {
+        handlePlayerPaused(guildId);
     });
 
     queue.player.on(AudioPlayerStatus.Idle, () => {
@@ -300,11 +742,22 @@ async function createQueue(guildId, voiceChannel) {
         process: null,
         songs: [],
         timeout: null,
-        paused: false
+        inactivityTimeout: null,
+        voiceChannelInterval: null,
+        paused: false,
+        voiceChannelId: voiceChannel.id,
+        guild: voiceChannel.guild,
+        nowPlayingMessage: null,
+        progressInterval: null,
+        currentStartedAt: null,
+        currentElapsedMs: 0,
+        ignoreNextIdle: false,
+        controlLock: false
     };
 
     attachQueueListeners(guildId, queue);
     queues.set(guildId, queue);
+    startVoiceChannelMonitor(guildId, queue);
 
     return queue;
 }
@@ -322,7 +775,8 @@ async function getOrCreateQueue(guildId, voiceChannel) {
         existingQueue.player?.state?.status === AudioPlayerStatus.Idle;
 
     if (
-        existingQueue.connection?.state?.status === VoiceConnectionStatus.Destroyed
+        existingQueue.connection?.state?.status ===
+        VoiceConnectionStatus.Destroyed
     ) {
         destroyQueue(guildId, { destroyConnection: false });
         return createQueue(guildId, voiceChannel);
@@ -339,6 +793,10 @@ async function getOrCreateQueue(guildId, voiceChannel) {
         );
     }
 
+    existingQueue.guild = voiceChannel.guild;
+    existingQueue.voiceChannelId = voiceChannel.id;
+    startVoiceChannelMonitor(guildId, existingQueue);
+
     return existingQueue;
 }
 
@@ -349,5 +807,7 @@ module.exports = {
     playNextAvailableSong,
     scheduleDisconnect,
     clearDisconnectTimeout,
-    destroyQueue
+    destroyQueue,
+    setNowPlayingMessage,
+    handleControlInteraction
 };
